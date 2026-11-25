@@ -1,0 +1,79 @@
+name: Bench 30 frames Tacoma
+
+# Tes kecepatan GitHub Actions untuk render Tacoma (Remotion + three.js).
+# Cara pakai: Actions tab -> Bench 30 frames Tacoma -> Run workflow.
+# Default: frame 0-29 (hook, scene paling ringan) + fast props yang sama
+# seperti di InstaBox. Hasil + waktu per frame ada di Summary + Artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      frames:
+        description: "Frame range, contoh 0-29"
+        required: true
+        default: "0-29"
+      concurrency:
+        description: "Concurrency Remotion"
+        required: true
+        default: "2"
+
+jobs:
+  bench:
+    name: Bench Tacoma ${{ inputs.frames }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner info
+        run: |
+          echo "CPUs: $(nproc)"
+          free -h
+          df -h .
+          node --version || true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chrome for Remotion
+        run: npx remotion browser ensure
+
+      - name: Render bench
+        run: |
+          START=$(date +%s)
+          echo "START=$START" >> $GITHUB_ENV
+          mkdir -p out
+          npx remotion render TacomaShort out/bench.mp4 \
+            --frames="${{ inputs.frames }}" \
+            --concurrency="${{ inputs.concurrency }}" \
+            --gl=angle \
+            --props='{"post":{"lens":false,"bloom":false,"msaa":false,"shadows":false}}'
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "ELAPSED=$ELAPSED" >> $GITHUB_ENV
+          echo "Render selesai dalam ${ELAPSED} detik"
+
+      - name: Report timing
+        run: |
+          # Hitung detik/frame dari range, misal 0-29 = 30 frame
+          A=$(echo "${{ inputs.frames }}" | cut -d- -f1)
+          B=$(echo "${{ inputs.frames }}" | cut -d- -f2)
+          N=$((B - A + 1))
+          echo "Frames: $N" | tee bench-result.txt
+          echo "Elapsed: ${ELAPSED}s" | tee -a bench-result.txt
+          echo "Sec/frame (wall, concurrency ${{ inputs.concurrency }}): $(awk "BEGIN {printf \"%.1f\", $ELAPSED / $N}") s" | tee -a bench-result.txt
+          echo "Sec/frame (per-frame cost): $(awk "BEGIN {printf \"%.1f\", $ELAPSED * ${{ inputs.concurrency }} / $N}") s" | tee -a bench-result.txt
+          ls -lh out/bench.mp4
+          ffprobe -v error -show_entries format=duration,size -show_entries stream=width,height,r_frame_rate,codec_name -of default=noprint_wrappers=1 out/bench.mp4 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ inputs.frames }}
+          path: |
+            out/bench.mp4
+            bench-result.txt
+          retention-days: 7
