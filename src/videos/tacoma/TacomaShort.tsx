@@ -1,0 +1,155 @@
+// "Jembatan yang Roboh karena Angin": the Tacoma Narrows short in the flat-characters-in-a-3D-toon-world
+// style (cartoon_3d_short skill). One three.js world (world.ts) posed per frame from the story timeline
+// (story.ts). Post chain (look-match pass):
+//   InkPass (world ink lines, own pass) -> lens blur pre + main (thin-lens DOF per shot from dofAt) ->
+//   [bloom (emissive only) + NEUTRAL tone mapping + colour grade] (one merged EffectPass), MSAA 4.
+// Ink runs before the DOF so lines blur with what they belong to; bloom after the DOF so glows defocus with their
+// source; the grade is display-referred, so it comes after tone mapping. Every pixel-sized parameter is specified at
+// 1080x1920 and scaled with the output size, so stills at --scale 0.5 and the 1080x1920 final match.
+// Place changes crossfade by stacking a second canvas for the fade frames; the hook ends on a 4-frame white flash.
+// Subtitles: house style — white bold, black outline, yellow keyword highlight, bottom center.
+import React, { useEffect, useMemo, useState } from "react";
+import * as THREE from "three";
+import { AbsoluteFill, continueRender, delayRender, getInputProps, useCurrentFrame } from "remotion";
+import { ThreeCanvas } from "@remotion/three";
+import { useThree } from "@react-three/fiber";
+import { EffectComposer } from "@react-three/postprocessing";
+import { BlendFunction, BloomEffect, ToneMappingEffect, ToneMappingMode } from "postprocessing";
+import { World, loadKit } from "./world";
+import { InkPass, noInkFallback } from "./ink";
+import { LensBlur, GrainEffect } from "./lensblur";
+import { GradeEffect, GRADES, GRADE_STRENGTH, gradeFor } from "./grade";
+import { Kit } from "./build";
+import { TOTAL, FLASH_AT, SHOTS, layersAt, dofAt, subAt } from "./story";
+
+export const TACOMA_FRAMES = TOTAL;
+
+/** A/B switches for test stills only (Remotion inputProps `{ post: { ink: false, ... } }`); everything is on by default. */
+type PostToggles = { ink: boolean; lens: boolean; pre: boolean; bloom: boolean; grade: boolean; grain: boolean; msaa: boolean; shadows: boolean };
+const toggles = (): PostToggles => ({ ink: true, lens: true, pre: true, bloom: true, grade: true, grain: false, msaa: true, shadows: true, ...((getInputProps() as { post?: Partial<PostToggles> }).post ?? {}) });
+
+/** Bloom for emissive sources only (depth.md 6.4). Its MIP chain always starts at 540x960 (half of 1080x1920),
+ *  whatever the output size, so the glow keeps the same size relative to the frame (e-fold ~30 px at 1080p,
+ *  ~1.5 % of the frame height) at 540, 1080 and 1440 widths. ADD blend: HDR-safe (SCREEN darkens values > 1). */
+const makeBloom = () => {
+  const b = new BloomEffect({ blendFunction: BlendFunction.ADD, intensity: 0.5, luminanceThreshold: 1.0, luminanceSmoothing: 0.2, mipmapBlur: true, levels: 6, radius: 0.6 });
+  const mip = b.mipmapBlurPass;
+  const setSize = mip.setSize.bind(mip);
+  mip.setSize = (w: number, h: number) => setSize(Math.round((1920 * w) / Math.max(h, 1)), 1920);
+  return b;
+};
+
+const fwd = new THREE.Vector3(), fpt = new THREE.Vector3();
+
+const useKit = () => {
+  const [kit, setKit] = useState<Kit | null>(null);
+  const [handle] = useState(() => delayRender("tacoma kit"));
+  useEffect(() => { loadKit().then((k) => { setKit(k); continueRender(handle); }); }, [handle]);
+  return kit;
+};
+
+const Inner: React.FC<{ id: number; kit: Kit }> = ({ id, kit }) => {
+  const f = useCurrentFrame();
+  const { camera, scene } = useThree();
+  const world = useMemo(() => new World(kit), [kit]);
+  const target = useMemo(() => new THREE.Vector3(), []);
+  const on = useMemo(toggles, []);
+  const fx = useMemo(() => ({
+    ink: new InkPass(scene, camera as THREE.PerspectiveCamera),
+    lens: new LensBlur({ maxCoC: 24, nearScale: 1.2 }),
+    bloom: makeBloom(),
+    tone: new ToneMappingEffect({ mode: ToneMappingMode.NEUTRAL }),
+    grade: new GradeEffect(GRADES.day, GRADE_STRENGTH.day),
+    grain: new GrainEffect({ amount: 0.025, cellPx: 1.5 }), // film grain, OFF by default (inputProps post.grain): the reference measures no grain and it quadruples the file size
+  }), [camera, scene]);
+  // NB: the dispose call is guarded — during a crossfade the outgoing ShotView
+  // unmounts and this cleanup runs; on some mounts fx.ink has no dispose yet,
+  // which used to throw "fx.ink.dispose is not a function" and kill the render
+  // at the crossfade end (frame 1508, shot 11). Guarded 2026-11-25.
+  useEffect(() => () => fx.ink?.dispose?.(), [fx]);
+  const post = useMemo(() => {
+    const kids: React.ReactElement[] = [];
+    if (on.ink) kids.push(<primitive key="ink" object={fx.ink} dispose={null} />);
+    if (on.lens && on.pre) kids.push(<primitive key="pre" object={fx.lens.pre} dispose={null} />);
+    if (on.lens) kids.push(<primitive key="lens" object={fx.lens.main} dispose={null} />);
+    if (on.bloom) kids.push(<primitive key="bloom" object={fx.bloom} dispose={null} />);
+    kids.push(<primitive key="tone" object={fx.tone} dispose={null} />);
+    if (on.grade) kids.push(<primitive key="grade" object={fx.grade} dispose={null} />);
+    if (on.grain) kids.push(<primitive key="grain" object={fx.grain} dispose={null} />);
+    return <EffectComposer multisampling={on.msaa ? 4 : 0}>{kids}</EffectComposer>;
+  }, [fx, on]);
+  const cam = camera as THREE.PerspectiveCamera;
+  target.copy(world.update(id, f, cam, scene));
+  noInkFallback(world.root);
+  // thin-lens focus: distance along the view axis to the shot's focus point (default: the camera's look target)
+  const d = dofAt(f);
+  cam.getWorldDirection(fwd);
+  if (d.focus) fpt.set(...d.focus(f)); else fpt.copy(target);
+  fx.lens.focus = Math.max(0.3, fpt.sub(cam.position).dot(fwd));
+  fx.lens.cInf = d.cInf;
+  gradeFor(fx.grade, SHOTS[id - 1].light);
+  fx.grain.seed = f; // deterministic per frame
+  return (
+    <>
+      <primitive object={world.root} dispose={null} />
+      {post}
+    </>
+  );
+};
+
+/** test stills only: inputProps `{ post: { dpr: 0.5 } }` forces the WebGL buffer size (R3F clamps dpr to >= 1 by default) */
+const dprOverride = () => (getInputProps() as { post?: { dpr?: number } }).post?.dpr;
+const ShotView: React.FC<{ id: number; kit: Kit; alpha: number }> = ({ id, kit, alpha }) => {
+  const on = useMemo(toggles, []);
+  return (
+  <AbsoluteFill style={{ opacity: alpha }}>
+    <ThreeCanvas width={1080} height={1920} {...(dprOverride() ? { dpr: dprOverride() } : {})} shadows={on.shadows} gl={{ antialias: false, stencil: false, powerPreference: "high-performance", toneMappingExposure: 1.0 }}
+      camera={{ fov: 40, near: 0.2, far: 1500 }}>
+      <Inner id={id} kit={kit} />
+    </ThreeCanvas>
+  </AbsoluteFill>
+  );
+};
+
+/** subtitles: white bold with a black outline, the keyword in yellow, bottom center */
+const Subtitles: React.FC = () => {
+  const f = useCurrentFrame();
+  const sub = subAt(f);
+  if (!sub) return null;
+  const parts = sub.text.split(sub.hl);
+  return (
+    <AbsoluteFill style={{ justifyContent: "flex-end", alignItems: "center", paddingBottom: 130, pointerEvents: "none" }}>
+      <div style={{
+        fontFamily: "Arial, Helvetica, sans-serif",
+        fontWeight: 800,
+        fontSize: 44,
+        lineHeight: 1.25,
+        color: "#ffffff",
+        textAlign: "center",
+        maxWidth: 900,
+        textShadow: "-2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000, 0 -2px 0 #000, 0 2px 0 #000, -2px 0 0 #000, 2px 0 0 #000, 0 4px 8px rgba(0,0,0,0.6)",
+      }}>
+        {parts.map((part, i) => (
+          <span key={i}>
+            {part}
+            {i < parts.length - 1 && <span style={{ color: "#ffd400" }}>{sub.hl}</span>}
+          </span>
+        ))}
+      </div>
+    </AbsoluteFill>
+  );
+};
+
+export const TacomaShort: React.FC = () => {
+  const f = useCurrentFrame();
+  const kit = useKit();
+  if (!kit) return null;
+  const flash = f >= FLASH_AT && f < FLASH_AT + 4 ? [1, 0.75, 0.45, 0.2][f - FLASH_AT] : 0;
+  return (
+    <AbsoluteFill style={{ background: "#cfe3f2" }}>
+      {layersAt(f).map((l, i) => <ShotView key={i ? "over" : "base"} id={l.id} kit={kit} alpha={l.alpha} />)}
+      {flash > 0 && <AbsoluteFill style={{ background: "#ffffff", opacity: flash }} />}
+      <Subtitles />
+    </AbsoluteFill>
+  );
+};
